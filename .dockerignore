@@ -1,0 +1,9 @@
+node_modules
+frontend
+test
+.env
+.env.example
+.git
+.vscode
+.DS_Store
+*.md

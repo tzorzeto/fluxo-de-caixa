@@ -1,0 +1,364 @@
+openapi: 3.0.3
+info:
+  title: API Financeira
+  version: 1.0.0
+  description: >-
+    API multi-tenant de fluxo de caixa: lançamentos financeiros (assíncronos, via fila)
+    e saldos diários consolidados. O tenant (comerciante) é resolvido a partir do JWT;
+    cada tenant tem fuso e janela retroativa próprios.
+
+servers:
+  - url: http://localhost:3000
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    LoginRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          example: admin@example.com
+        senha:
+          type: string
+          example: 123456
+      required: [email, senha]
+
+    LoginResponse:
+      type: object
+      properties:
+        token:
+          type: string
+          description: JWT de autenticação
+
+    LancamentoRequest:
+      type: object
+      properties:
+        tipo_movimento:
+          type: string
+          enum: [CREDITO, DEBITO]
+        valor:
+          type: number
+          format: double
+        descricao:
+          type: string
+          nullable: true
+        criado_em:
+          type: string
+          format: date-time
+          nullable: true
+      required: [tipo_movimento, valor]
+
+    Lancamento:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        tipo_movimento:
+          type: string
+        valor:
+          type: number
+          format: double
+        descricao:
+          type: string
+          nullable: true
+        criado_em:
+          type: string
+          format: date-time
+
+    LancamentoUpdateRequest:
+      type: object
+      properties:
+        tipo_movimento:
+          type: string
+          enum: [CREDITO, DEBITO]
+        valor:
+          type: number
+          format: double
+        descricao:
+          type: string
+          nullable: true
+
+    SaldoDiario:
+      type: object
+      properties:
+        data:
+          type: string
+          format: date
+        saldo_inicio:
+          type: number
+          format: double
+        total_creditos:
+          type: number
+          format: double
+        total_debitos:
+          type: number
+          format: double
+        saldo_fim:
+          type: number
+          format: double
+        status:
+          type: string
+          enum: [aberto, fechado]
+        fechado_em:
+          type: string
+          format: date-time
+          nullable: true
+        reaberto_em:
+          type: string
+          format: date-time
+          nullable: true
+
+paths:
+  /login:
+    post:
+      summary: Login
+      description: Retorna um JWT para autenticação.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login bem-sucedido
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          description: Credenciais inválidas
+        '400':
+          description: Requisição inválida
+
+  /lancamentos:
+    post:
+      summary: Enfileirar lançamento
+      description: >-
+        Publica um lançamento na fila e responde 202 com o id gerado.
+        Envie o header Idempotency-Key (UUID) para que um retry não duplique o lançamento.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LancamentoRequest'
+      responses:
+        '202':
+          description: Lançamento enfileirado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: enfileirado
+                  id:
+                    type: string
+                    format: uuid
+                  lancamento:
+                    $ref: '#/components/schemas/LancamentoRequest'
+        '400':
+          description: Dados inválidos ou criado_em fora da janela retroativa do tenant
+        '401':
+          description: Não autenticado
+        '403':
+          description: Comerciante do token não encontrado
+        '409':
+          description: Dia fechado; reabrir exige perfil gestor
+        '503':
+          description: Fila indisponível; tente novamente
+
+    get:
+      summary: Listar lançamentos
+      description: Retorna lançamentos já persistidos no banco.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Lista de lançamentos
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Lancamento'
+        '401':
+          description: Não autenticado
+        '500':
+          description: Erro no servidor
+
+  /lancamentos/{id}:
+    put:
+      summary: Atualizar lançamento
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LancamentoUpdateRequest'
+      responses:
+        '200':
+          description: Lançamento atualizado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Lancamento'
+        '400':
+          description: Requisição inválida
+        '401':
+          description: Não autenticado
+        '404':
+          description: Lançamento não encontrado
+        '409':
+          description: Lançamento fora da janela editável, ou dia fechado e usuário sem perfil gestor
+        '500':
+          description: Erro no servidor
+
+  /saldos-diarios:
+    get:
+      summary: Listar saldos diários
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Lista de saldos diários
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SaldoDiario'
+        '401':
+          description: Não autenticado
+        '500':
+          description: Erro no servidor
+
+  /saldos-diarios/{data}:
+    get:
+      summary: Buscar saldo diário por data
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: data
+          in: path
+          required: true
+          schema:
+            type: string
+            format: date
+          description: Data no formato YYYY-MM-DD
+      responses:
+        '200':
+          description: Saldo do dia
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SaldoDiario'
+        '401':
+          description: Não autenticado
+        '404':
+          description: Não encontrado
+        '500':
+          description: Erro no servidor
+
+  /saldos-diarios/{data}/reprocessar:
+    post:
+      summary: Reprocessar saldo a partir de uma data
+      description: Recalcula o saldo da data informada e de todos os dias seguintes.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: data
+          in: path
+          required: true
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: Reprocessado
+        '400':
+          description: Data inválida
+        '401':
+          description: Não autenticado
+        '500':
+          description: Erro no servidor
+
+  /health:
+    get:
+      summary: Health check (sem autenticação)
+      responses:
+        '200':
+          description: API no ar
+
+  /status:
+    get:
+      summary: Status das dependências (PostgreSQL, RabbitMQ)
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Status por serviço
+        '401':
+          description: Não autenticado
+
+  /admin/tenants:
+    post:
+      summary: Provisionar comerciante (tenant)
+      description: >-
+        Cria schema, role de banco e usuário inicial do comerciante. Disponível apenas
+        quando ADMIN_TOKEN está configurado; autenticação por esse token.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nome, usuario]
+              properties:
+                nome: { type: string }
+                fuso: { type: string, example: America/Sao_Paulo }
+                hora_fechamento: { type: string, example: "18:00" }
+                usuario:
+                  type: object
+                  required: [email, senha]
+                  properties:
+                    email: { type: string }
+                    senha: { type: string }
+      responses:
+        '201':
+          description: Tenant criado
+        '400':
+          description: Dados inválidos
+        '401':
+          description: Token administrativo inválido
+        '409':
+          description: Email já cadastrado
